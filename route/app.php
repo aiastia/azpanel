@@ -31,6 +31,7 @@ Route::post('/forget',       'Auth/resetPassword');
 
 Route::get('/user',            'UserDashboard/index');
 Route::get('/user/login',      'UserDashboard/loginLog');
+Route::get('/user/recycle',    'UserDashboard/recycle');
 
 Route::get('/user/profile',                       'UserDashboard/profile');
 Route::get('/user/profile/sshkey',                'UserDashboard/createSshKey');
@@ -63,6 +64,7 @@ Route::get('/user/server/azure/rule/log',         'UserAzureServerRule/log');
 // Azure 服务器
 Route::resource('/user/server/azure',             'UserAzureServer');
 Route::post('/user/server/azure/search',          'UserAzureServer/search');
+Route::post('/user/server/azure/available',       'UserAzureServer/available');
 Route::patch('/user/server/azure/:action/:uuid',  'UserAzureServer/status');
 Route::put('/user/server/azure/resize/:uuid',     'UserAzureServer/resize');
 Route::put('/user/server/azure/redisk/:uuid',     'UserAzureServer/redisk');

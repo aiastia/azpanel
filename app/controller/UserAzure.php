@@ -1,6 +1,7 @@
 <?php
 namespace app\controller;
 
+use think\facade\Db;
 use think\facade\Env;
 use think\facade\View;
 use GuzzleHttp\Client;
@@ -10,6 +11,7 @@ use app\controller\UserTask;
 use app\controller\UserAzureServer;
 use app\model\Azure;
 use app\model\AzureServer;
+use app\model\AzureRecycle;
 
 class UserAzure extends UserBase
 {
@@ -49,6 +51,14 @@ class UserAzure extends UserBase
 
     public function create()
     {
+        $notes = Db::table('azure')
+            ->where('user_id', session('user_id'))
+            ->where('user_mark', '<>', '')
+            ->distinct(true)
+            ->field('user_mark')
+            ->select();
+
+        View::assign('notes', $notes);
         return View::fetch('../app/view/user/azure/create.html');
     }
 
@@ -124,6 +134,8 @@ class UserAzure extends UserBase
         $az_secret    = input('az_secret/s');
         $az_tenant_id = input('az_tenant_id/s');
         $az_configs   = input('az_configs/s');
+        $ignore_status = input('ignore_status/s');
+        $remark_filling = input('remark_filling/s');
 
         // 如果没填 api 信息
         if ($az_app_id == '' && $az_secret == '' && $az_tenant_id == '' && $az_configs == '') {
@@ -179,7 +191,7 @@ class UserAzure extends UserBase
         $account->user_id    = session('user_id');
         $account->az_email   = $az_email;
         $account->az_passwd  = $az_passwd;
-        $account->user_mark  = $user_mark;
+        $account->user_mark  = ($remark_filling == 'input') ? $user_mark : $remark_filling;
         $account->az_api     = json_encode($az_api);
         $account->created_at = time();
         $account->updated_at = time();
@@ -191,7 +203,9 @@ class UserAzure extends UserBase
                 throw new \Exception('此账户无有效订阅。若有，建议使用以下命令获取 Api 参数 <div class="mdui-typo"><code>az ad sp create-for-rbac --role contributor --scopes /subscriptions/$(az account list --query [].id -o tsv)</code></div>');
             }
             if ($sub_info['value']['0']['state'] != 'Enabled') {
-                throw new \Exception('此账户第一个订阅的状态不是 Enabled');
+                if ($ignore_status == 'false') {
+                    throw new \Exception('此账户订阅状态异常，若有需要，请勾选忽略订阅状态');
+                }
             }
         } catch (\Exception $e) {
             Azure::destroy($account->id);
@@ -213,8 +227,10 @@ class UserAzure extends UserBase
             $account->save();
         }
 
-        $client = new Client();
-        AzureApi::registerMainAzureProviders($client, $account, 'Microsoft.Capacity');
+        if ($sub_info['value']['0']['state'] == 'Enabled') {
+            $client = new Client();
+            AzureApi::registerMainAzureProviders($client, $account, 'Microsoft.Capacity');
+        }
 
         return json(Tools::msg('1', '添加结果', $content));
     }
@@ -241,18 +257,46 @@ class UserAzure extends UserBase
 
     public function delete($id)
     {
-        Azure::where('user_id', session('user_id'))
-        ->where('id', $id)
-        ->delete();
+        $account = Azure::where('user_id', session('user_id'))
+            ->find($id);
+
+        $cycle = new AzureRecycle;
+        $cycle->user_id = session('user_id');
+        $cycle->az_email = $account->az_email;
+        $cycle->az_sub_type = $account->az_sub_type;
+        $cycle->user_mark = $account->user_mark;
+        $cycle->bill_charges = self::estimatedCost($id, true);
+        $cycle->life_cycle = self::getEarliestTime($id);
+        $cycle->created_at = time();
+        $cycle->save();
 
         AzureServer::where('user_id', session('user_id'))
         ->where('account_id', $id)
         ->delete();
 
+        $account->delete();
         return json(Tools::msg('1', '删除成功', '将返回账户列表'));
     }
 
-    public function estimatedCost($id)
+    public static function getEarliestTime($id)
+    {
+        $time_set = [];
+        $account = Azure::find($id);
+        $servers = AzureServer::where('account_id', $id)->select();
+
+        foreach ($servers as $server) {
+            $disk_details = json_decode($server->disk_details, true);
+            $vm_disk_created = strtotime($disk_details['properties']['timeCreated']);
+            $time_set[] = $vm_disk_created;
+        }
+
+        $min_value = ($account->updated_at > min($time_set)) ? min($time_set) : $account->updated_at;
+        $min_timestamp = round((time() - $min_value) / 86400, 2);
+
+        return $min_timestamp;
+    }
+
+    public static function estimatedCost($id, $api = false)
     {
         try {
             $vm_charges = 0;
@@ -265,8 +309,12 @@ class UserAzure extends UserBase
             ->select();
             foreach ($servers as $server)
             {
-                $instance_details = json_decode($server->instance_details, true);
-                $vm_disk_created = strtotime($instance_details['disks']['0']['statuses']['0']['time']);
+                if (empty($server->disk_details)) {
+                    $server->disk_details = json_encode(AzureApi::getDisks($server));
+                    $server->save();
+                }
+                $disk_details = json_decode($server->disk_details, true);
+                $vm_disk_created = strtotime($disk_details['properties']['timeCreated']);
                 $start_time = date('Y-m-d\T H:i:00\Z', $vm_disk_created - 28800);
                 $stop_time = date('Y-m-d\T H:i:00\Z', time() - 28800);
                 $cumulative_running_time = (time() - $vm_disk_created) / 2592000;
@@ -293,7 +341,11 @@ class UserAzure extends UserBase
         . '预估流量费用：<span style="float: right">' . round($traffic_charges, 2) . ' USD</span>' . '<br/>'
         . '累计费用：<span style="float: right">' . round($vm_charges + $traffic_charges, 2) . ' USD</span>';
 
-        return json(Tools::msg('0', '统计结果', $text));
+        if ($api) {
+            return round($vm_charges + $traffic_charges, 2);
+        } else {
+            return json(Tools::msg('0', '统计结果', $text));
+        }
     }
 
     public static function refreshTheResourceStatusUnderTheAccount($account)
@@ -345,6 +397,10 @@ class UserAzure extends UserBase
             if (in_array($type_name, $refresh_account_type)) {
                 $query_set[] = $type_name;
             }
+        }
+
+        if (in_array('Unknown', $query_set)) {
+            array_push($query_set, 'MSDN Platforms Subscription', 'VS Enterprise: BizSpark', 'Azure 3500', 'Unknown');
         }
 
         $accounts = Azure::where('user_id', $user_id)
@@ -421,6 +477,16 @@ class UserAzure extends UserBase
         }
 
         foreach ($accounts as $account) {
+            $cycle = new AzureRecycle;
+            $cycle->user_id = session('user_id');
+            $cycle->az_email = $account->az_email;
+            $cycle->az_sub_type = $account->az_sub_type;
+            $cycle->user_mark = $account->user_mark;
+            $cycle->bill_charges = self::estimatedCost($account->id, true);
+            $cycle->life_cycle = self::getEarliestTime($account->id);
+            $cycle->created_at = time();
+            $cycle->save();
+
             AzureServer::where('account_id', $account->id)->delete();
             Azure::destroy($account->id);
         }

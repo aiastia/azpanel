@@ -113,6 +113,7 @@ class UserAzureServer extends UserBase
         $vm_ssh_key      = (int) input('vm_ssh_key/s');
         $vm_traffic_rule = (int) input('vm_traffic_rule/s');
         $create_check    = (int) input('create_check/s');
+        $create_ipv6     = (bool) input('create_ipv6/s');
 
         // 创建账户检查
         if ($vm_account == '') {
@@ -205,14 +206,23 @@ class UserAzureServer extends UserBase
                 'location'    => $vm_location,
                 'size'        => $vm_size,
                 'script'      => $vm_script,
+                'ipv6'        => $create_ipv6,
             ]
         ];
+
+        /* if (session('user_id') != 1) {
+            return json(Tools::msg('0', '创建失败', '维护中'));
+        } */
 
         // 初始化创建任务
         $progress = 0;
         $client   = new Client();
         $steps    = ($vm_number * 6) + 6;
         $task_id  = UserTask::create(session('user_id'), '创建虚拟机', $params, $task_uuid);
+
+        if ($create_ipv6) {
+            $steps += 2; // 多了创建ipv6地址和网络安全组的任务
+        }
 
         if ($account->reg_capacity == '0') {
             ++$steps;
@@ -265,6 +275,7 @@ class UserAzureServer extends UserBase
                     }
                 }
                 $size_family = $limit['family'];
+                $single_size_core = $limit['capabilities']['2']['value'];
             }
         }
 
@@ -290,13 +301,13 @@ class UserAzureServer extends UserBase
             $sizes = AzureList::sizes();
             $quotas = AzureApi::getQuota($account, $vm_location);
             if (! isset($sizes[$vm_size]['cpu'])) {
-                foreach ($limits['value'] as $limit)
+                /* foreach ($limits['value'] as $limit)
                 {
                     if ($limit['name'] == $vm_size) {
                         $single_size_core = $limit['capabilities']['2']['value'];
                         break;
                     }
-                }
+                } */
                 $cores_total = $single_size_core * $vm_number;
             } else {
                 $cores_total = $sizes[$vm_size]['cpu'] * $vm_number;
@@ -338,7 +349,13 @@ class UserAzureServer extends UserBase
 
         foreach ($names as $vm_name)
         {
-            $vm_ip_name              = $vm_name . '_ipv4';
+            // default value
+            $ipv6 = false;
+            $security_group_id = '';
+            // name settings
+            $vm_ipv4_name            = $vm_name . '_ipv4';
+            $vm_ipv6_name            = $vm_name . '_ipv6';
+            $security_group_name     = $vm_name . '_security';
             $vm_resource_group_name  = $vm_name . '_group';
             $vm_virtual_network_name = $vm_name . '_vnet';
 
@@ -359,30 +376,48 @@ class UserAzureServer extends UserBase
                     $client, $account, $vm_resource_group_name, $vm_location
                 );
 
-                // 创建公网地址
+                if ($create_ipv6) {
+                    // 创建网络安全组
+                    UserTask::update($task_id, (++$progress / $steps), '在资源组 ' . $vm_resource_group_name . ' 中创建网络安全组');
+                    sleep(2);
+                    $security_group_id = AzureApi::createNetworkSecurityGroups(
+                        $client, $account, $vm_resource_group_name, $vm_location, $security_group_name
+                    );
+                }
+
+                // 创建公网ipv4地址
                 sleep(2);
-                UserTask::update($task_id, (++$progress / $steps), '在资源组 ' . $vm_resource_group_name . ' 中创建公网地址');
-                $ip = AzureApi::createAzurePublicNetworkIpv4(
-                    $client, $account, $vm_ip_name, $vm_resource_group_name, $vm_location
+                UserTask::update($task_id, (++$progress / $steps), '在资源组 ' . $vm_resource_group_name . ' 中创建 ipv4 地址');
+                $ipv4 = AzureApi::createAzurePublicNetworkIpv4(
+                    $client, $account, $vm_ipv4_name, $vm_resource_group_name, $vm_location, $create_ipv6
                 );
+
+                if ($create_ipv6) {
+                    // 创建公网ipv6地址
+                    UserTask::update($task_id, (++$progress / $steps), '在资源组 ' . $vm_resource_group_name . ' 中创建 ipv6 地址');
+                    sleep(2);
+                    $ipv6 = AzureApi::createAzurePublicNetworkIpv6(
+                        $client, $account, $vm_ipv6_name, $vm_resource_group_name, $vm_location
+                    );
+                }
 
                 // 创建虚拟网络
                 UserTask::update($task_id, (++$progress / $steps), '在资源组 ' . $vm_resource_group_name . ' 中创建虚拟网络');
                 AzureApi::createAzureVirtualNetwork(
-                    $client, $account, $vm_virtual_network_name, $vm_resource_group_name, $vm_location
+                    $client, $account, $vm_virtual_network_name, $vm_resource_group_name, $vm_location, $create_ipv6
                 );
 
                 // 创建子网
                 UserTask::update($task_id, (++$progress / $steps), '在虚拟网络 ' . $vm_virtual_network_name . ' 中创建子网');
                 $subnets = AzureApi::createAzureVirtualNetworkSubnets(
-                    $client, $account, $vm_virtual_network_name, $vm_resource_group_name, $vm_location
+                    $client, $account, $vm_virtual_network_name, $vm_resource_group_name, $vm_location, $create_ipv6
                 );
 
                 // 创建网络接口
                 sleep(3);
                 UserTask::update($task_id, (++$progress / $steps), '在资源组 ' . $vm_resource_group_name . ' 中创建网络接口');
                 $interfaces = AzureApi::createAzureVirtualNetworkInterfaces(
-                    $client, $account, $vm_name, $ip, $subnets, $vm_location, $vm_size
+                    $client, $account, $vm_name, $ipv4, $ipv6, $subnets, $vm_location, $vm_size, $create_ipv6, $security_group_id
                 );
 
                 // 创建虚拟机
@@ -658,6 +693,10 @@ class UserAzureServer extends UserBase
         $task_id = UserTask::create(session('user_id'), '更换公网地址', $params, $task_uuid);
 
         try {
+            if (isset($server->ipv6_address)) {
+                throw new \Exception('此虚拟机 ipv4 是静态类型地址，不支持更换');
+            }
+
             UserTask::update($task_id, (++$count / 4), '正在分离计算资源');
             AzureApi::virtualMachinesDeallocate($server->account_id, $server->request_url);
 
@@ -682,7 +721,11 @@ class UserAzureServer extends UserBase
             $server->ip_address         = $network_details['properties']['ipConfigurations']['0']['properties']['publicIPAddress']['properties']['ipAddress'] ?? 'null';
             $server->save();
         } catch (\Exception $e) {
-            $error = $e->getResponse()->getBody()->getContents();
+            if ($e->getMessage() != null) {
+                $error = $e->getMessage();
+            } else {
+                $error = $e->getResponse()->getBody()->getContents();
+            }
             UserTask::end($task_id, true, $error);
             return json(Tools::msg('0', '更换失败', $error));
         }

@@ -215,6 +215,9 @@ class AzureApi extends BaseController
                 $network_details = self::getAzureNetworkInterfacesDetails($account_id, $network_interfaces, $params['4'], $params['2']);
                 $server->network_details    = json_encode($network_details);
                 $server->ip_address         = $network_details['properties']['ipConfigurations']['0']['properties']['publicIPAddress']['properties']['ipAddress'] ?? 'null';
+                if (isset($network_details['properties']['ipConfigurations']['1']['name'])) {
+                    $server->ipv6_address = $network_details['properties']['ipConfigurations']['1']['properties']['publicIPAddress']['properties']['ipAddress'];
+                }
 
                 $server->vm_details         = json_encode($virtual_machine);
                 $server->instance_details   = json_encode($instance_details);
@@ -306,8 +309,65 @@ class AzureApi extends BaseController
         ]);
     }
 
-    public static function createAzurePublicNetworkIpv4($client, $account, $ip_name, $resource_group_name, $location)
-    {
+    public static function createNetworkSecurityGroups(
+        $client, $account, $resource_group_name, $location, $name
+    ) {
+        // https://docs.microsoft.com/zh-cn/rest/api/virtualnetwork/network-security-groups/create-or-update
+
+        $body = [
+            'location' => $location,
+            'properties' => [
+                'securityRules' => [
+                    [
+                        'name' => 'allow_any_in',
+                        'properties' =>  [
+                            'protocol' => '*',
+                            'sourcePortRange' => '*',
+                            'destinationPortRange' => '*',
+                            'sourceAddressPrefix' => '*',
+                            'destinationAddressPrefix' => '*',
+                            'access' => 'Allow',
+                            'priority' => 100,
+                            'direction' => 'Inbound',
+                            'sourcePortRanges' => [],
+                            'destinationPortRanges' => [],
+                            'sourceAddressPrefixes' => [],
+                            'destinationAddressPrefixes' => []
+                        ]
+                    ],
+                    [
+                        'name' => 'allow_any_out',
+                        'properties' =>  [
+                            'protocol' => '*',
+                            'sourcePortRange' => '*',
+                            'destinationPortRange' => '*',
+                            'sourceAddressPrefix' => '*',
+                            'destinationAddressPrefix' => '*',
+                            'access' => 'Allow',
+                            'priority' => 110,
+                            'direction' => 'Outbound',
+                            'sourcePortRanges' => [],
+                            'destinationPortRanges' => [],
+                            'sourceAddressPrefixes' => [],
+                            'destinationAddressPrefixes' => []
+                        ]
+                    ]
+                ],
+            ],
+        ];
+
+        $url = 'https://management.azure.com/subscriptions/' . $account->az_sub_id . '/resourcegroups/' . $resource_group_name . '/providers/Microsoft.Network/networkSecurityGroups/' . $name . '?api-version=2022-01-01';
+        $result = $client->put($url, [
+            'headers' => self::getToken($account->id, true),
+            'json' => $body
+        ]);
+        $resource_url = json_decode($result->getBody());
+        return $resource_url->id;
+    }
+
+    public static function createAzurePublicNetworkIpv4(
+        $client, $account, $ip_name, $resource_group_name, $location, $create_ipv6
+    ) {
         // https://docs.microsoft.com/zh-cn/rest/api/virtualnetwork/public-ip-addresses
 
         $label = Str::random($length = 10);
@@ -316,6 +376,54 @@ class AzureApi extends BaseController
         $body = [
             'location' => $location,
             'properties' => [
+                'dnsSettings' => [
+                    'domainNameLabel' => $label
+                ]
+            ]
+        ];
+
+        if ($create_ipv6) {
+            $body['sku'] = [
+                'name' => 'Standard',
+                'tier' => 'Regional',
+            ];
+            $body['properties']['publicIPAddressVersion'] = 'IPv4';
+            $body['properties']['publicIPAllocationMethod'] = 'Static';
+        }
+
+        $url = 'https://management.azure.com/subscriptions/' . $account->az_sub_id . '/resourceGroups/' . $resource_group_name . '/providers/Microsoft.Network/publicIPAddresses/' . $ip_name . '?api-version=2021-03-01';
+
+        $promise = $client->requestAsync('PUT', $url, [
+            'headers' => self::getToken($account->id, true),
+            'json' => $body
+        ]);
+
+        $promise->then(function (ResponseInterface $response) {
+            $object = json_decode($response->getBody());
+            return $object->id;
+        });
+
+        $result   = $promise->wait();
+        $resource_url = json_decode($result->getBody());
+        return $resource_url->id;
+    }
+
+    public static function createAzurePublicNetworkIpv6($client, $account, $ip_name, $resource_group_name, $location)
+    {
+        // https://docs.microsoft.com/zh-cn/rest/api/virtualnetwork/public-ip-addresses
+
+        $label = Str::random($length = 10);
+        $label = Str::lower($label);
+
+        $body = [
+            'sku' => [
+                'name' => 'Standard',
+                'tier' => 'Regional',
+            ],
+            'location' => $location,
+            'properties' => [
+                'publicIPAddressVersion' => 'IPv6',
+                'publicIPAllocationMethod' => 'Static',
                 'dnsSettings' => [
                     'domainNameLabel' => $label
                 ]
@@ -334,7 +442,7 @@ class AzureApi extends BaseController
             return $object->id;
         });
 
-        $result   = $promise->wait();
+        $result = $promise->wait();
         $resource_url = json_decode($result->getBody());
         return $resource_url->id;
     }
@@ -362,8 +470,9 @@ class AzureApi extends BaseController
         return $count;
     }
 
-    public static function createAzureVirtualNetwork($client, $account, $virtual_network_name, $resource_group_name, $location)
-    {
+    public static function createAzureVirtualNetwork(
+        $client, $account, $virtual_network_name, $resource_group_name, $location, $create_ipv6
+    ) {
         // https://docs.microsoft.com/zh-cn/rest/api/virtualnetwork/virtual-networks/create-or-update
 
         $body = [
@@ -377,6 +486,13 @@ class AzureApi extends BaseController
             ]
         ];
 
+        if ($create_ipv6) {
+            $body['properties']['addressSpace']['addressPrefixes'] = [
+                '10.0.0.0/16',
+                'ace:ceb:deca::/48',
+            ];
+        }
+
         $url = 'https://management.azure.com/subscriptions/' . $account->az_sub_id . '/resourceGroups/' . $resource_group_name . '/providers/Microsoft.Network/virtualNetworks/' . $virtual_network_name . '?api-version=2021-03-01';
 
         $result = $client->put($url, [
@@ -385,9 +501,11 @@ class AzureApi extends BaseController
         ]);
     }
 
-    public static function createAzureVirtualNetworkSubnets($client, $account, $virtual_network_name, $resource_group_name, $location)
-    {
+    public static function createAzureVirtualNetworkSubnets(
+        $client, $account, $virtual_network_name, $resource_group_name, $location, $create_ipv6
+    ) {
         // https://docs.microsoft.com/zh-cn/rest/api/virtualnetwork/subnets/create-or-update
+        // https://luotianyi.vc/5607.html
 
         $body = [
             'location' => $location,
@@ -395,6 +513,14 @@ class AzureApi extends BaseController
                 'addressPrefix' => '10.0.0.0/16'
             ]
         ];
+
+        if ($create_ipv6) {
+            unset($body['properties']['addressPrefix']);
+            $body['properties']['addressPrefixes'] = [
+                '10.0.0.0/16',
+                'ace:ceb:deca:deed::/64',
+            ];
+        }
 
         $subnet_url = 'https://management.azure.com/subscriptions/' . $account->az_sub_id . '/resourceGroups/' . $resource_group_name . '/providers/Microsoft.Network/virtualNetworks/' . $virtual_network_name . '/subnets/default?api-version=2021-03-01';
 
@@ -408,7 +534,9 @@ class AzureApi extends BaseController
         return $subnet_object->id;
     }
 
-    public static function createAzureVirtualNetworkInterfaces($client, $account, $vm_name, $ip_url, $subnets_url, $location, $vm_size) {
+    public static function createAzureVirtualNetworkInterfaces(
+        $client, $account, $vm_name, $ipv4_url, $ipv6_url, $subnets_url, $location, $vm_size, $create_ipv6, $security_group_id
+    ) {
         // https://docs.microsoft.com/zh-cn/rest/api/virtualnetwork/network-interfaces/create-or-update
 
         $body = [
@@ -417,20 +545,38 @@ class AzureApi extends BaseController
                 'enableAcceleratedNetworking' => false,
                 'ipConfigurations' => [
                     [
-                        'name' => 'ipconfiguraion',
+                        'name' => 'ipconfiguraion_v4',
                         'properties' => [
                             'publicIPAddress' => [
-                                'id' => $ip_url
+                                'id' => $ipv4_url,
                             ],
                             'subnet' => [
-                                'id' => $subnets_url
-                            ]
-                        ]
-                    ]
-                ]
-            ]
-
+                                'id' => $subnets_url,
+                            ],
+                        ],
+                    ],
+                ],
+            ],
         ];
+
+        if ($create_ipv6) {
+            $body['properties']['ipConfigurations']['0']['properties']['primary'] = true;
+            $body['properties']['ipConfigurations'][] = [
+                'name' => 'ipconfiguraion_v6',
+                'properties' => [
+                    'privateIPAddressVersion' => 'IPv6',
+                    'publicIPAddress' => [
+                        'id' => $ipv6_url,
+                    ],
+                    'subnet' => [
+                        'id' => $subnets_url,
+                    ],
+                ],
+            ];
+            $body['properties']['networkSecurityGroup'] = [
+                'id' => $security_group_id,
+            ];
+        }
 
         // With the GA of AN, region limitations have been removed, making the feature widely available around the world. Supported VM series include D/DSv2, D/DSv3, E/ESv3, F/FS, FSv2, and Ms/Mms.
 

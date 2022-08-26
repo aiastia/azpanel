@@ -253,7 +253,15 @@ class UserAzureServer extends UserBase
                         UserTask::end($task_id, true, json_encode(
                             ['msg' => 'This subscription cannot create VMs of this size in this region.']
                         ), true);
-                        return json(Tools::msg('0', '创建失败', '此订阅似乎不能在此区域创建此规格虚拟机。如不信任此检测结果，可以在创建页面将 “创建资格检查” 设置为 “忽略” 后重试'));
+                        return json(Tools::msg('0', '创建失败', '此订阅似乎不能在此区域创建此规格虚拟机。如不信任此检测结果，可以在创建页面将 “检查” 设置为 “忽略” 后重试'));
+                    }
+                }
+                if ($limit['capabilities']['4']['value'] == 'V1') {
+                    if (Str::contains($images[$vm_image]['sku'], 'gen2')) {
+                        UserTask::end($task_id, true, json_encode(
+                            ['msg' => 'The virtual machine model is not compatible with the image.']
+                        ), true);
+                        return json(Tools::msg('0', '创建失败', '此规格虚拟机不可使用镜像列表中包含 gen2 关键词的选项'));
                     }
                 }
                 $size_family = $limit['family'];
@@ -281,7 +289,18 @@ class UserAzureServer extends UserBase
         try {
             $sizes = AzureList::sizes();
             $quotas = AzureApi::getQuota($account, $vm_location);
-            $cores_total = $sizes[$vm_size]['cpu'] * $vm_number;
+            if (! isset($sizes[$vm_size]['cpu'])) {
+                foreach ($limits['value'] as $limit)
+                {
+                    if ($limit['name'] == $vm_size) {
+                        $single_size_core = $limit['capabilities']['2']['value'];
+                        break;
+                    }
+                }
+                $cores_total = $single_size_core * $vm_number;
+            } else {
+                $cores_total = $sizes[$vm_size]['cpu'] * $vm_number;
+            }
 
             foreach ($quotas['value'] as $quota)
             {
@@ -867,7 +886,11 @@ class UserAzureServer extends UserBase
         {
             if ($limit['resourceType'] == 'virtualMachines') {
                 if (empty($limit['restrictions']['0']['reasonCode'])) {
-                    $set[] = $limit['name'];
+                    $size = [
+                        'name' => $limit['name'],
+                        'size_name' => $limit['name'] . ' => ' . $limit['capabilities']['2']['value'] . 'C_' . $limit['capabilities']['5']['value'] . 'GB',
+                    ];
+                    array_push($set, $size);
                 }
             }
         }

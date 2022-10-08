@@ -280,6 +280,17 @@ class UserAzureServer extends UserBase
             }
         }
 
+        if ($create_check == '1' && $account->az_sub_type == 'FreeTrial') {
+            $ip_num = AzureApi::countAzurePublicNetworkIpv4($client, $account, $vm_location);
+            $available = 3 - $ip_num;
+            if ($vm_number + $ip_num >= 4) {
+                UserTask::end($task_id, true, json_encode(
+                    ['msg' => 'FreeTrial subscriptions are only allowed up to 3 IPs per region.']
+                ), true);
+                return json(Tools::msg('0', '创建失败', "试用订阅在每个区域的公网地址数量被限制为不能超过三个，当前区域还有 ${$available} 个公网地址配额。如不信任此检测结果，可以在创建页面将 “检查” 设置为 “忽略” 后重试"));
+            }
+        }
+
         // 资源组检查
         UserTask::update($task_id, (++$progress / $steps), '正在检查资源组');
         $resource_groups = AzureApi::getAzureResourceGroupsList($account->id, $account->az_sub_id);
@@ -440,7 +451,7 @@ class UserAzureServer extends UserBase
         // 直到最后一个创建的虚拟机运行状态变为 running 再将所创建的虚拟机加入到列表中
         $count = 0;
         do {
-            sleep(1);
+            sleep(2);
             ++$count;
             $vm_status = AzureApi::getAzureVirtualMachineStatus($account->id, $vm_url);
             $status = $vm_status['statuses']['1']['code'] ?? 'null';
@@ -686,6 +697,7 @@ class UserAzureServer extends UserBase
     public function change($uuid)
     {
         $count = 0;
+        $steps = 5;
         $task_uuid = input('task_uuid/s');
         $server = AzureServer::where('vm_id', $uuid)->find();
         $params = [
@@ -699,7 +711,16 @@ class UserAzureServer extends UserBase
                 throw new \Exception('此虚拟机 ipv4 是静态类型地址，不支持更换');
             }
 
-            UserTask::update($task_id, (++$count / 4), '正在分离计算资源');
+            UserTask::update($task_id, (++$count / $steps), "正在检查 {$server->name} 归属订阅状态");
+            $sub_info = AzureApi::getAzureSubscription($server->account_id); // array
+            if ($sub_info['value']['0']['state'] != 'Enabled') {
+                UserTask::end($task_id, true, json_encode(
+                    ['msg' => 'This subscription is disabled and therefore marked as read only.']
+                ), true);
+                return json(Tools::msg('0', '更换失败', '订阅状态被设置为 Disabled 或 Warned'));
+            }
+
+            UserTask::update($task_id, (++$count / $steps), "正在分离 {$server->name} 计算资源");
             AzureApi::virtualMachinesDeallocate($server->account_id, $server->request_url);
 
             do {
@@ -708,7 +729,8 @@ class UserAzureServer extends UserBase
                 $status = $vm_status['statuses']['1']['code'] ?? 'null';
             } while ($status != 'PowerState/deallocated');
 
-            UserTask::update($task_id, (++$count / 4), '正在启动虚拟机');
+            sleep(3);
+            UserTask::update($task_id, (++$count / $steps), "正在启动虚拟机 {$server->name}");
             AzureApi::manageVirtualMachine('start', $server->account_id, $server->request_url);
 
             do {
@@ -717,7 +739,7 @@ class UserAzureServer extends UserBase
                 $status = $vm_status['statuses']['1']['code'] ?? 'null';
             } while ($status != 'PowerState/running');
 
-            UserTask::update($task_id, (++$count / 4), '正在获取新地址');
+            UserTask::update($task_id, (++$count / $steps), "正在获取 {$server->name} 新地址");
             $network_details = AzureApi::getAzureNetworkInterfacesDetails($server->account_id, $server->network_interfaces, $server->resource_group, $server->at_subscription_id);
             $server->network_details    = json_encode($network_details);
             $server->ip_address         = $network_details['properties']['ipConfigurations']['0']['properties']['publicIPAddress']['properties']['ipAddress'] ?? 'null';
@@ -728,7 +750,9 @@ class UserAzureServer extends UserBase
             } else {
                 $error = $e->getResponse()->getBody()->getContents();
             }
-            UserTask::end($task_id, true, $error);
+            UserTask::end($task_id, true, json_encode(
+                ['msg' => $error])
+            );
             return json(Tools::msg('0', '更换失败', $error));
         }
 
@@ -930,7 +954,8 @@ class UserAzureServer extends UserBase
         foreach ($limits['value'] as $limit)
         {
             if ($limit['resourceType'] == 'virtualMachines') {
-                if (empty($limit['restrictions']['0']['reasonCode'])) {
+                // 若虚拟机规格中包含关键字p 则代表是arm64处理器 与默认镜像不兼容 因此需要过滤掉
+                if (empty($limit['restrictions']['0']['reasonCode']) && !Str::contains($limit['name'], 'p')) {
                     $size = [
                         'name' => $limit['name'],
                         'size_name' => $limit['name'] . ' => ' . $limit['capabilities']['2']['value'] . 'C_' . $limit['capabilities']['5']['value'] . 'GB',

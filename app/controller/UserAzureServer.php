@@ -61,7 +61,7 @@ class UserAzureServer extends UserBase
         $ssh_key = SshKey::where('user_id', session('user_id'))->find();
 
         $designated_id = (int) input('id');
-        if ($designated_id != '') {
+        if ($designated_id !== 0) {
             $designated_account = Azure::where('user_id', session('user_id'))->where('id', $designated_id)->find();
             if ($designated_account == null) {
                 return View::fetch('../app/view/user/reject.html');
@@ -880,11 +880,25 @@ class UserAzureServer extends UserBase
             $statistics = AzureApi::getVirtualMachineStatistics($server, $start_time, $stop_time);
         }
 
-        $cpu_credits       = $statistics['value']['1']['timeseries']['0']['data'];
-        $percentage_cpu    = $statistics['value']['0']['timeseries']['0']['data'];
-        $available_memory  = $statistics['value']['2']['timeseries']['0']['data'];
-        $network_in_total  = $statistics['value']['3']['timeseries']['0']['data'];
-        $network_out_total = $statistics['value']['4']['timeseries']['0']['data'];
+        //dump($statistics['value']);
+
+        foreach ($statistics['value'] as $key => $value) {
+            if ($value['name']['value'] == 'Network In Total') {
+                $network_in_total  = $statistics['value'][$key]['timeseries']['0']['data'];
+            }
+            if ($value['name']['value'] == 'Network Out Total') {
+                $network_out_total = $statistics['value'][$key]['timeseries']['0']['data'];
+            }
+            if ($value['name']['value'] == 'Percentage CPU') {
+                $percentage_cpu    = $statistics['value'][$key]['timeseries']['0']['data'];
+            }
+            if ($value['name']['value'] == 'CPU Credits Remaining') {
+                $cpu_credits       = $statistics['value'][$key]['timeseries']['0']['data'];
+            }
+            if ($value['name']['value'] == 'Available Memory Bytes') {
+                $available_memory  = $statistics['value'][$key]['timeseries']['0']['data'];
+            }
+        }
 
         $traffic_usage = Traffic::where('uuid', $server->vm_id)->order('id', 'desc')->select();
         $chart_day = (empty($chart_day)) ? null : $chart_day;

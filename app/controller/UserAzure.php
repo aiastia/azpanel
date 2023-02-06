@@ -272,12 +272,12 @@ class UserAzure extends UserBase
         if ($az_configs != '') {
             $configs = json_decode($az_configs, true);
             $decode_error = json_last_error();
-            if ($decode_error != 'JSON_ERROR_NONE') {
+            if ($decode_error !== 0) {
                 $az_email = Tools::getMailAddress($az_configs);
                 $json_text = Tools::getJsonContent($az_configs);
                 $configs = json_decode($json_text, true);
                 $decode_error = json_last_error();
-                if ($decode_error != 'JSON_ERROR_NONE') {
+                if ($decode_error !== 0) {
                     return json(Tools::msg('0', '添加失败', '此 json 内容格式不规范'));
                 }
             }
@@ -463,10 +463,10 @@ class UserAzure extends UserBase
                 $stop_time = date('Y-m-d\T H:i:00\Z', time() - 28800);
                 $cumulative_running_time = (time() - $vm_disk_created) / 2592000;
                 $statistics = AzureApi::getVirtualMachineStatistics($server, $start_time, $stop_time);
-                if (!isset($statistics['value']['3']['timeseries']['0']['data'])) {
-                    $network_in_total = $statistics['value']['0']['timeseries']['0']['data'];
-                } else {
-                    $network_in_total = $statistics['value']['3']['timeseries']['0']['data'];
+                foreach ($statistics['value'] as $key => $value) {
+                    if ($value['name']['value'] == 'Network In Total') {
+                        $network_in_total  = $statistics['value'][$key]['timeseries']['0']['data'];
+                    }
                 }
                 $network_in_traffic = UserAzureServer::processNetworkData($network_in_total, true);
                 $traffic_charges += 0.08 * $network_in_traffic;
